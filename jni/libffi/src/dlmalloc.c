@@ -592,6 +592,11 @@ DEFAULT_MMAP_THRESHOLD       default: 256K
   malloc does support the following options.
 */
 
+/* The system's malloc.h may have conflicting defines. */
+#undef M_TRIM_THRESHOLD
+#undef M_GRANULARITY
+#undef M_MMAP_THRESHOLD
+
 #define M_TRIM_THRESHOLD     (-1)
 #define M_GRANULARITY        (-2)
 #define M_MMAP_THRESHOLD     (-3)
@@ -1273,7 +1278,9 @@ extern void*     sbrk(ptrdiff_t);
 #define CHUNK_ALIGN_MASK    (MALLOC_ALIGNMENT - SIZE_T_ONE)
 
 /* True if address a has acceptable alignment */
+#ifndef is_aligned
 #define is_aligned(A)       (((size_t)((A)) & (CHUNK_ALIGN_MASK)) == 0)
+#endif
 
 /* the number of bytes to offset an address to align it */
 #define align_offset(A)\
@@ -3942,10 +3949,7 @@ static void* internal_memalign(mstate m, size_t alignment, size_t bytes) {
           We've allocated enough total room so that this is always
           possible.
         */
-        char* br = (char*)mem2chunk((size_t)(((size_t)(mem +
-                                                       alignment -
-                                                       SIZE_T_ONE)) &
-                                             -alignment));
+        char* br = (char*)mem2chunk(FFI_ALIGN(mem, alignment));
         char* pos = ((size_t)(br - (char*)(p)) >= MIN_CHUNK_SIZE)?
           br : br+alignment;
         mchunkptr newp = (mchunkptr)pos;

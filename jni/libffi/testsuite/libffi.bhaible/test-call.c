@@ -50,6 +50,7 @@ int _fprintf(FILE *stream, const char *format, ...)
     case 3:
       vsprintf(&rbuf2[strlen(rbuf2)], format, args);
       printf("%s", rbuf2);
+      fflush (stdout);
       if (strcmp (rbuf1, rbuf2)) abort();
       break;
     }
@@ -455,7 +456,11 @@ void
 
 #if (!defined(DGTEST)) || DGTEST == 19
   vpr = vp_vpdpcpsp(&uc1,&d2,str3,&I4);
+#ifdef __CHERI_PURE_CAPABILITY__
+  fprintf(out,"->0x%#p\n",vpr);
+#else
   fprintf(out,"->0x%p\n",vpr);
+#endif
   fflush(out);
   vpr = 0; clear_traces();
   {
@@ -471,7 +476,11 @@ void
       FFI_CALL(cif,vp_vpdpcpsp,args,&vpr);
     }
   }
+#ifdef __CHERI_PURE_CAPABILITY__
+  fprintf(out,"->0x%#p\n",vpr);
+#else
   fprintf(out,"->0x%p\n",vpr);
+#endif
   fflush(out);
 #endif  
   return;

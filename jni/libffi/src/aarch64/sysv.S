@@ -46,61 +46,90 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.  */
 # define BE(X)	0
 #endif
 
+#ifdef __CHERI_PURE_CAPABILITY__
+/* XXX: defining sp to csp is a rather ugly hack to avoid more changes. */
+#define sp              csp
+#define PTR_REG(n)      c##n
+#define INT_REG(n)      x##n
+#define GP_REG(n)       c##n
+#else
 #ifdef __ILP32__
 #define PTR_REG(n)      w##n
 #else
 #define PTR_REG(n)      x##n
 #endif
+#define GP_REG(n)       x##n
+#define INT_REG(n)      x##n
+#endif
 
+#ifdef __CHERI_PURE_CAPABILITY__
+#define PTR_SIZE	16
+#define GP_REG_SIZE	16
+#else
 #ifdef __ILP32__
 #define PTR_SIZE	4
 #else
 #define PTR_SIZE	8
 #endif
-
-#if FFI_EXEC_TRAMPOLINE_TABLE && defined(__MACH__) && defined(HAVE_PTRAUTH)
-# define BR(r)  braaz r
-# define BLR(r) blraaz r
-#else
-# define BR(r)  br r
-# define BLR(r) blr r
+#define GP_REG_SIZE	8
 #endif
 
 	.text
 	.align 4
 
 /* ffi_call_SYSV
-   extern void ffi_call_SYSV (void *stack, void *frame,
+   extern void ffi_call_SYSV (struct call_context *context, void *frame,
 			      void (*fn)(void), void *rvalue,
 			      int flags, void *closure);
 
    Therefore on entry we have:
 
-   x0 stack
+   x0 context
    x1 frame
    x2 fn
    x3 rvalue
    x4 flags
    x5 closure
 */
-
+	.globl	CNAME(ffi_call_SYSV)
+	FFI_HIDDEN(CNAME(ffi_call_SYSV))
+#ifdef __ELF__
+	.type	CNAME(ffi_call_SYSV), #function
+#endif
 	cfi_startproc
 CNAME(ffi_call_SYSV):
-	/* Use a stack frame allocated by our caller.  */
-	cfi_def_cfa(x1, 32);
-	stp	x29, x30, [x1]
-	mov	x29, x1
-	mov	sp, x0
-	cfi_def_cfa_register(x29)
-	cfi_rel_offset (x29, 0)
-	cfi_rel_offset (x30, 8)
+	/* Sign the lr with x1 since that is where it will be stored */
+	SIGN_LR_WITH_REG(PTR_REG(1))
 
-	mov	x9, x2			/* save fn */
-	mov	x8, x3			/* install structure return */
-#ifdef FFI_GO_CLOSURES
-	mov	x18, x5			/* install static chain */
+	/* Use a stack frame allocated by our caller.  */
+#if defined(HAVE_PTRAUTH) && defined(__APPLE__)
+	/* darwin's libunwind assumes that the cfa is the sp and that's the data
+	 * used to sign the lr.  In order to allow unwinding through this
+	 * function it is necessary to point the cfa at the signing register.
+	 */
+	cfi_def_cfa(GP_REG(1), 0);
+#else
+	cfi_def_cfa(GP_REG(1), CALL_FRAME_SIZE);
 #endif
-	stp	x3, x4, [x29, #16]	/* save rvalue and flags */
+	stp	GP_REG(29), GP_REG(30), [PTR_REG(1)]
+	mov	GP_REG(9), sp
+	str	GP_REG(9), [PTR_REG(1), #4*GP_REG_SIZE]
+	mov	GP_REG(29), GP_REG(1)
+#ifdef __CHERI_PURE_CAPABILITY__
+	scvalue	csp, csp, x0	/* restore stack bounds on context */
+#else
+	mov	sp, GP_REG(0)
+#endif
+	cfi_def_cfa_register(GP_REG(29))
+	cfi_rel_offset (GP_REG(29), 0)
+	cfi_rel_offset (GP_REG(30), GP_REG_SIZE)
+
+	mov	GP_REG(9), GP_REG(2)			/* save fn */
+	mov	GP_REG(8), GP_REG(3)			/* install structure return */
+#ifdef FFI_GO_CLOSURES
+	mov	GP_REG(18), GP_REG(5)			/* install static chain */
+#endif
+	stp	GP_REG(3), GP_REG(4), [PTR_REG(29), #2*GP_REG_SIZE]	/* save rvalue and flags */
 
 	/* Load the vector argument passing registers, if necessary.  */
 	tbz	w4, #AARCH64_FLAG_ARG_V_BIT, 1f
@@ -111,105 +140,120 @@ CNAME(ffi_call_SYSV):
 1:
 	/* Load the core argument passing registers, including
 	   the structure return pointer.  */
-	ldp     x0, x1, [sp, #16*N_V_ARG_REG + 0]
-	ldp     x2, x3, [sp, #16*N_V_ARG_REG + 16]
-	ldp     x4, x5, [sp, #16*N_V_ARG_REG + 32]
-	ldp     x6, x7, [sp, #16*N_V_ARG_REG + 48]
+	ldp     GP_REG(0), GP_REG(1), [sp, #16*N_V_ARG_REG + 0*GP_REG_SIZE]
+	ldp     GP_REG(2), GP_REG(3), [sp, #16*N_V_ARG_REG + 2*GP_REG_SIZE]
+	ldp     GP_REG(4), GP_REG(5), [sp, #16*N_V_ARG_REG + 4*GP_REG_SIZE]
+	ldp     GP_REG(6), GP_REG(7), [sp, #16*N_V_ARG_REG + 6*GP_REG_SIZE]
 
 	/* Deallocate the context, leaving the stacked arguments.  */
 	add	sp, sp, #CALL_CONTEXT_SIZE
 
-	BLR(x9)				/* call fn */
+	BRANCH_AND_LINK_TO_REG     PTR_REG(9)			/* call fn */
 
-	ldp	x3, x4, [x29, #16]	/* reload rvalue and flags */
+	ldp	GP_REG(3), GP_REG(4), [PTR_REG(29), #2*GP_REG_SIZE]	/* reload rvalue and flags */
 
 	/* Partially deconstruct the stack frame.  */
-	mov     sp, x29
+	ldr	GP_REG(9), [PTR_REG(29), #4*GP_REG_SIZE]
+	mov	sp, GP_REG(9)
 	cfi_def_cfa_register (sp)
-	ldp     x29, x30, [x29]
+	cfi_rel_offset (GP_REG(29), 0)
+	cfi_rel_offset (GP_REG(30), GP_REG_SIZE)
+	mov	GP_REG(2), GP_REG(29)			/* Preserve for auth */
+	ldp     GP_REG(29), GP_REG(30), [PTR_REG(29)]
 
 	/* Save the return value as directed.  */
-	adr	x5, 0f
+#ifdef __CHERI_PURE_CAPABILITY__
+	/* We have to ensure that the LSB remains set to stay in C64 mode. */
+	adr	GP_REG(5), 0f+1
+#else
+	adr	GP_REG(5), 0f
+#endif
 	and	w4, w4, #AARCH64_RET_MASK
-	add	x5, x5, x4, lsl #3
-	br	x5
+	add	PTR_REG(5), PTR_REG(5), INT_REG(4), lsl #3
+	br	PTR_REG(5)
 
 	/* Note that each table entry is 2 insns, and thus 8 bytes.
 	   For integer data, note that we're storing into ffi_arg
 	   and therefore we want to extend to 64 bits; these types
 	   have two consecutive entries allocated for them.  */
 	.align	4
-0:	ret				/* VOID */
+0:	b 99f				/* VOID */
 	nop
-1:	str	x0, [x3]		/* INT64 */
-	ret
-2:	stp	x0, x1, [x3]		/* INT128 */
-	ret
-3:	brk	#1000			/* UNUSED */
-	ret
+1:	str	x0, [PTR_REG(3)]		/* INT64 */
+	b 99f
+2:	stp	x0, x1, [PTR_REG(3)]		/* INT128 */
+	b 99f
+3:	str	PTR_REG(0), [PTR_REG(3)]	/* POINTER */
+	b 99f
 4:	brk	#1000			/* UNUSED */
-	ret
+	b 99f
 5:	brk	#1000			/* UNUSED */
-	ret
+	b 99f
 6:	brk	#1000			/* UNUSED */
-	ret
+	b 99f
 7:	brk	#1000			/* UNUSED */
-	ret
-8:	st4	{ v0.s, v1.s, v2.s, v3.s }[0], [x3]	/* S4 */
-	ret
-9:	st3	{ v0.s, v1.s, v2.s }[0], [x3]	/* S3 */
-	ret
-10:	stp	s0, s1, [x3]		/* S2 */
-	ret
-11:	str	s0, [x3]		/* S1 */
-	ret
-12:	st4	{ v0.d, v1.d, v2.d, v3.d }[0], [x3]	/* D4 */
-	ret
-13:	st3	{ v0.d, v1.d, v2.d }[0], [x3]	/* D3 */
-	ret
-14:	stp	d0, d1, [x3]		/* D2 */
-	ret
-15:	str	d0, [x3]		/* D1 */
-	ret
-16:	str	q3, [x3, #48]		/* Q4 */
+	b 99f
+8:	st4	{ v0.s, v1.s, v2.s, v3.s }[0], [PTR_REG(3)]	/* S4 */
+	b 99f
+9:	st3	{ v0.s, v1.s, v2.s }[0], [PTR_REG(3)]	/* S3 */
+	b 99f
+10:	stp	s0, s1, [PTR_REG(3)]		/* S2 */
+	b 99f
+11:	str	s0, [PTR_REG(3)]		/* S1 */
+	b 99f
+12:	st4	{ v0.d, v1.d, v2.d, v3.d }[0], [PTR_REG(3)]	/* D4 */
+	b 99f
+13:	st3	{ v0.d, v1.d, v2.d }[0], [PTR_REG(3)]	/* D3 */
+	b 99f
+14:	stp	d0, d1, [PTR_REG(3)]		/* D2 */
+	b 99f
+15:	str	d0, [PTR_REG(3)]		/* D1 */
+	b 99f
+16:	str	q3, [PTR_REG(3), #48]		/* Q4 */
 	nop
-17:	str	q2, [x3, #32]		/* Q3 */
+17:	str	q2, [PTR_REG(3), #32]		/* Q3 */
 	nop
-18:	stp	q0, q1, [x3]		/* Q2 */
-	ret
-19:	str	q0, [x3]		/* Q1 */
-	ret
+18:	stp	q0, q1, [PTR_REG(3)]		/* Q2 */
+	b 99f
+19:	str	q0, [PTR_REG(3)]		/* Q1 */
+	b 99f
 20:	uxtb	w0, w0			/* UINT8 */
-	str	x0, [x3]
-21:	ret				/* reserved */
+	str	x0, [PTR_REG(3)]
+21:	b 99f				/* reserved */
 	nop
 22:	uxth	w0, w0			/* UINT16 */
-	str	x0, [x3]
-23:	ret				/* reserved */
+	str	x0, [PTR_REG(3)]
+23:	b 99f				/* reserved */
 	nop
 24:	mov	w0, w0			/* UINT32 */
-	str	x0, [x3]
-25:	ret				/* reserved */
+	str	x0, [PTR_REG(3)]
+25:	b 99f				/* reserved */
 	nop
 26:	sxtb	x0, w0			/* SINT8 */
-	str	x0, [x3]
-27:	ret				/* reserved */
+	str	x0, [PTR_REG(3)]
+27:	b 99f				/* reserved */
 	nop
 28:	sxth	x0, w0			/* SINT16 */
-	str	x0, [x3]
-29:	ret				/* reserved */
+	str	x0, [PTR_REG(3)]
+29:	b 99f				/* reserved */
 	nop
 30:	sxtw	x0, w0			/* SINT32 */
-	str	x0, [x3]
-31:	ret				/* reserved */
+	str	x0, [PTR_REG(3)]
+31:	b 99f				/* reserved */
 	nop
+
+	/* Return now that result has been populated. */
+99:
+	AUTH_LR_WITH_REG(PTR_REG(2))
+#ifdef __CHERI_PURE_CAPABILITY__
+	ret c30
+#else
+	ret
+#endif
 
 	cfi_endproc
 
-	.globl	CNAME(ffi_call_SYSV)
-	FFI_HIDDEN(CNAME(ffi_call_SYSV))
 #ifdef __ELF__
-	.type	CNAME(ffi_call_SYSV), #function
 	.size CNAME(ffi_call_SYSV), .-CNAME(ffi_call_SYSV)
 #endif
 
@@ -232,12 +276,18 @@ CNAME(ffi_call_SYSV):
 #define ffi_closure_SYSV_FS (8*2 + CALL_CONTEXT_SIZE + 64)
 
 	.align 4
+	.globl	CNAME(ffi_closure_SYSV_V)
+	FFI_HIDDEN(CNAME(ffi_closure_SYSV_V))
+#ifdef __ELF__
+	.type	CNAME(ffi_closure_SYSV_V), #function
+#endif
 CNAME(ffi_closure_SYSV_V):
 	cfi_startproc
-	stp     x29, x30, [sp, #-ffi_closure_SYSV_FS]!
+	SIGN_LR
+	stp     GP_REG(29), GP_REG(30), [sp, #-ffi_closure_SYSV_FS]!
 	cfi_adjust_cfa_offset (ffi_closure_SYSV_FS)
-	cfi_rel_offset (x29, 0)
-	cfi_rel_offset (x30, 8)
+	cfi_rel_offset (GP_REG(29), 0)
+	cfi_rel_offset (GP_REG(30), GP_REG_SIZE)
 
 	/* Save the argument passing vector registers.  */
 	stp     q0, q1, [sp, #16 + 0]
@@ -247,60 +297,63 @@ CNAME(ffi_closure_SYSV_V):
 	b	0f
 	cfi_endproc
 
-	.globl	CNAME(ffi_closure_SYSV_V)
-	FFI_HIDDEN(CNAME(ffi_closure_SYSV_V))
 #ifdef __ELF__
-	.type	CNAME(ffi_closure_SYSV_V), #function
 	.size	CNAME(ffi_closure_SYSV_V), . - CNAME(ffi_closure_SYSV_V)
 #endif
 
 	.align	4
+	.globl	CNAME(ffi_closure_SYSV)
+	FFI_HIDDEN(CNAME(ffi_closure_SYSV))
+#ifdef __ELF__
+	.type	CNAME(ffi_closure_SYSV), #function
+#endif
 	cfi_startproc
 CNAME(ffi_closure_SYSV):
-	stp     x29, x30, [sp, #-ffi_closure_SYSV_FS]!
+	SIGN_LR
+	stp     GP_REG(29), GP_REG(30), [sp, #-ffi_closure_SYSV_FS]!
 	cfi_adjust_cfa_offset (ffi_closure_SYSV_FS)
-	cfi_rel_offset (x29, 0)
-	cfi_rel_offset (x30, 8)
+	cfi_rel_offset (GP_REG(29), 0)
+	cfi_rel_offset (GP_REG(30), GP_REG_SIZE)
 0:
-	mov     x29, sp
+	mov     GP_REG(29), sp
 
 	/* Save the argument passing core registers.  */
-	stp     x0, x1, [sp, #16 + 16*N_V_ARG_REG + 0]
-	stp     x2, x3, [sp, #16 + 16*N_V_ARG_REG + 16]
-	stp     x4, x5, [sp, #16 + 16*N_V_ARG_REG + 32]
-	stp     x6, x7, [sp, #16 + 16*N_V_ARG_REG + 48]
+	stp     GP_REG(0), GP_REG(1), [sp, #16 + 16*N_V_ARG_REG + 0*GP_REG_SIZE]
+	stp     GP_REG(2), GP_REG(3), [sp, #16 + 16*N_V_ARG_REG + 2*GP_REG_SIZE]
+	stp     GP_REG(4), GP_REG(5), [sp, #16 + 16*N_V_ARG_REG + 4*GP_REG_SIZE]
+	stp     GP_REG(6), GP_REG(7), [sp, #16 + 16*N_V_ARG_REG + 6*GP_REG_SIZE]
 
 	/* Load ffi_closure_inner arguments.  */
-	ldp	PTR_REG(0), PTR_REG(1), [x17, #FFI_TRAMPOLINE_CLOSURE_OFFSET]	/* load cif, fn */
-	ldr	PTR_REG(2), [x17, #FFI_TRAMPOLINE_CLOSURE_OFFSET+PTR_SIZE*2]	/* load user_data */
+	ldp	PTR_REG(0), PTR_REG(1), [PTR_REG(17), #FFI_TRAMPOLINE_CLOSURE_OFFSET]	/* load cif, fn */
+	ldr	PTR_REG(2), [PTR_REG(17), #FFI_TRAMPOLINE_CLOSURE_OFFSET+PTR_SIZE*2]	/* load user_data */
 #ifdef FFI_GO_CLOSURES
 .Ldo_closure:
 #endif
-	add	x3, sp, #16				/* load context */
-	add	x4, sp, #ffi_closure_SYSV_FS		/* load stack */
-	add	x5, sp, #16+CALL_CONTEXT_SIZE		/* load rvalue */
-	mov	x6, x8					/* load struct_rval */
+	add	PTR_REG(3), sp, #16				/* load context */
+	add	PTR_REG(4), sp, #ffi_closure_SYSV_FS		/* load stack */
+	add	PTR_REG(5), sp, #16+CALL_CONTEXT_SIZE		/* load rvalue */
+	mov	GP_REG(6), GP_REG(8)					/* load struct_rval */
+#ifdef __ELF__
+	.type	CNAME(ffi_closure_SYSV_inner), #function
+#endif
 	bl      CNAME(ffi_closure_SYSV_inner)
 
 	/* Load the return value as directed.  */
-#if FFI_EXEC_TRAMPOLINE_TABLE && defined(__MACH__) && defined(HAVE_PTRAUTH)
-	autiza	x1
-#endif
-	adr	x1, 0f
+	adr	PTR_REG(1), 0f
 	and	w0, w0, #AARCH64_RET_MASK
-	add	x1, x1, x0, lsl #3
-	add	x3, sp, #16+CALL_CONTEXT_SIZE
-	br	x1
+	add	PTR_REG(1), PTR_REG(1), INT_REG(0), lsl #3
+	add	PTR_REG(3), sp, #16+CALL_CONTEXT_SIZE
+	br	PTR_REG(1)
 
 	/* Note that each table entry is 2 insns, and thus 8 bytes.  */
 	.align	4
 0:	b	99f			/* VOID */
 	nop
-1:	ldr	x0, [x3]		/* INT64 */
+1:	ldr	x0, [PTR_REG(3)]		/* INT64 */
 	b	99f
-2:	ldp	x0, x1, [x3]		/* INT128 */
+2:	ldp	x0, x1, [PTR_REG(3)]		/* INT128 */
 	b	99f
-3:	brk	#1000			/* UNUSED */
+3:	ldr	PTR_REG(0), [PTR_REG(3)]	/* POINTER */
 	nop
 4:	brk	#1000			/* UNUSED */
 	nop
@@ -310,93 +363,94 @@ CNAME(ffi_closure_SYSV):
 	nop
 7:	brk	#1000			/* UNUSED */
 	nop
-8:	ldr	s3, [x3, #12]		/* S4 */
+8:	ldr	s3, [PTR_REG(3), #12]		/* S4 */
 	nop
-9:	ldr	s2, [x3, #8]		/* S3 */
+9:	ldr	s2, [PTR_REG(3), #8]		/* S3 */
 	nop
-10:	ldp	s0, s1, [x3]		/* S2 */
+10:	ldp	s0, s1, [PTR_REG(3)]		/* S2 */
 	b	99f
-11:	ldr	s0, [x3]		/* S1 */
+11:	ldr	s0, [PTR_REG(3)]		/* S1 */
 	b	99f
-12:	ldr	d3, [x3, #24]		/* D4 */
+12:	ldr	d3, [PTR_REG(3), #24]		/* D4 */
 	nop
-13:	ldr	d2, [x3, #16]		/* D3 */
+13:	ldr	d2, [PTR_REG(3), #16]		/* D3 */
 	nop
-14:	ldp	d0, d1, [x3]		/* D2 */
+14:	ldp	d0, d1, [PTR_REG(3)]		/* D2 */
 	b	99f
-15:	ldr	d0, [x3]		/* D1 */
+15:	ldr	d0, [PTR_REG(3)]		/* D1 */
 	b	99f
-16:	ldr	q3, [x3, #48]		/* Q4 */
+16:	ldr	q3, [PTR_REG(3), #48]		/* Q4 */
 	nop
-17:	ldr	q2, [x3, #32]		/* Q3 */
+17:	ldr	q2, [PTR_REG(3), #32]		/* Q3 */
 	nop
-18:	ldp	q0, q1, [x3]		/* Q2 */
+18:	ldp	q0, q1, [PTR_REG(3)]		/* Q2 */
 	b	99f
-19:	ldr	q0, [x3]		/* Q1 */
+19:	ldr	q0, [PTR_REG(3)]		/* Q1 */
 	b	99f
-20:	ldrb	w0, [x3, #BE(7)]	/* UINT8 */
+20:	ldrb	w0, [PTR_REG(3), #BE(7)]	/* UINT8 */
 	b	99f
 21:	brk	#1000			/* reserved */
 	nop
-22:	ldrh	w0, [x3, #BE(6)]	/* UINT16 */
+22:	ldrh	w0, [PTR_REG(3), #BE(6)]	/* UINT16 */
 	b	99f
 23:	brk	#1000			/* reserved */
 	nop
-24:	ldr	w0, [x3, #BE(4)]	/* UINT32 */
+24:	ldr	w0, [PTR_REG(3), #BE(4)]	/* UINT32 */
 	b	99f
 25:	brk	#1000			/* reserved */
 	nop
-26:	ldrsb	x0, [x3, #BE(7)]	/* SINT8 */
+26:	ldrsb	x0, [PTR_REG(3), #BE(7)]	/* SINT8 */
 	b	99f
 27:	brk	#1000			/* reserved */
 	nop
-28:	ldrsh	x0, [x3, #BE(6)]	/* SINT16 */
+28:	ldrsh	x0, [PTR_REG(3), #BE(6)]	/* SINT16 */
 	b	99f
 29:	brk	#1000			/* reserved */
 	nop
-30:	ldrsw	x0, [x3, #BE(4)]	/* SINT32 */
+30:	ldrsw	x0, [PTR_REG(3), #BE(4)]	/* SINT32 */
 	nop
 31:					/* reserved */
-99:	ldp     x29, x30, [sp], #ffi_closure_SYSV_FS
+99:	ldp     GP_REG(29), GP_REG(30), [sp], #ffi_closure_SYSV_FS
 	cfi_adjust_cfa_offset (-ffi_closure_SYSV_FS)
-	cfi_restore (x29)
-	cfi_restore (x30)
-	ret
+	cfi_restore (GP_REG(29))
+	cfi_restore (GP_REG(30))
+	AUTH_LR_AND_RET
 	cfi_endproc
 
-	.globl	CNAME(ffi_closure_SYSV)
-	FFI_HIDDEN(CNAME(ffi_closure_SYSV))
 #ifdef __ELF__
-	.type	CNAME(ffi_closure_SYSV), #function
 	.size	CNAME(ffi_closure_SYSV), . - CNAME(ffi_closure_SYSV)
 #endif
 
 #if defined(FFI_EXEC_STATIC_TRAMP)
 	.align 4
-CNAME(ffi_closure_SYSV_V_alt):
-	/* See the comments above trampoline_code_table. */
-	ldr	x17, [sp, #8]			/* Load closure in x17 */
-	add	sp, sp, #16			/* Restore the stack */
-	b	CNAME(ffi_closure_SYSV_V)
-
 	.globl	CNAME(ffi_closure_SYSV_V_alt)
 	FFI_HIDDEN(CNAME(ffi_closure_SYSV_V_alt))
 #ifdef __ELF__
 	.type	CNAME(ffi_closure_SYSV_V_alt), #function
+#endif
+CNAME(ffi_closure_SYSV_V_alt):
+	/* See the comments above trampoline_code_table. */
+	ldr	GP_REG(17), [sp, #GP_REG_SIZE]			/* Load closure in x17 */
+	add	sp, sp, #16			/* Restore the stack */
+	b	CNAME(ffi_closure_SYSV_V)
+
+#ifdef __ELF__
 	.size	CNAME(ffi_closure_SYSV_V_alt), . - CNAME(ffi_closure_SYSV_V_alt)
 #endif
 
 	.align 4
-CNAME(ffi_closure_SYSV_alt):
-	/* See the comments above trampoline_code_table. */
-	ldr	x17, [sp, #8]			/* Load closure in x17 */
-	add	sp, sp, #16			/* Restore the stack */
-	b	CNAME(ffi_closure_SYSV)
-
 	.globl	CNAME(ffi_closure_SYSV_alt)
 	FFI_HIDDEN(CNAME(ffi_closure_SYSV_alt))
 #ifdef __ELF__
 	.type	CNAME(ffi_closure_SYSV_alt), #function
+#endif
+CNAME(ffi_closure_SYSV_alt):
+	/* See the comments above trampoline_code_table. */
+	ldr	GP_REG(17), [sp, #GP_REG_SIZE]			/* Load closure in x17 */
+	add	sp, sp, #16			/* Restore the stack */
+	b	CNAME(ffi_closure_SYSV)
+
+#ifdef __ELF__
 	.size	CNAME(ffi_closure_SYSV_alt), . - CNAME(ffi_closure_SYSV_alt)
 #endif
 
@@ -420,22 +474,24 @@ CNAME(ffi_closure_SYSV_alt):
  * - restore the stack pointer to what it was when the trampoline was invoked.
  */
 	.align	AARCH64_TRAMP_MAP_SHIFT
-CNAME(trampoline_code_table):
-	.rept	AARCH64_TRAMP_MAP_SIZE / AARCH64_TRAMP_SIZE
-	sub	sp, sp, #16		/* Make space on the stack */
-	str	x17, [sp]		/* Save x17 on stack */
-	adr	x17, #16376		/* Get data address */
-	ldr	x17, [x17]		/* Copy data into x17 */
-	str	x17, [sp, #8]		/* Save data on stack */
-	adr	x17, #16372		/* Get code address */
-	ldr	x17, [x17]		/* Load code address into x17 */
-	br	x17			/* Jump to code */
-	.endr
-
 	.globl CNAME(trampoline_code_table)
 	FFI_HIDDEN(CNAME(trampoline_code_table))
 #ifdef __ELF__
 	.type	CNAME(trampoline_code_table), #function
+#endif
+CNAME(trampoline_code_table):
+	.rept	AARCH64_TRAMP_MAP_SIZE / AARCH64_TRAMP_SIZE
+	sub	sp, sp, #16		/* Make space on the stack */
+	str	GP_REG(17), [sp]		/* Save x17 on stack */
+	adr	GP_REG(17), #16376		/* Get data address */
+	ldr	GP_REG(17), [PTR_REG(17)]		/* Copy data into x17 */
+	str	GP_REG(17), [sp, #GP_REG_SIZE]		/* Save data on stack */
+	adr	GP_REG(17), #16372		/* Get code address */
+	ldr	GP_REG(17), [PTR_REG(17)]		/* Load code address into x17 */
+	br	PTR_REG(17)			/* Jump to code */
+	.endr
+
+#ifdef __ELF__
 	.size	CNAME(trampoline_code_table), . - CNAME(trampoline_code_table)
 #endif
 	.align	AARCH64_TRAMP_MAP_SHIFT
@@ -446,18 +502,20 @@ CNAME(trampoline_code_table):
 #ifdef __MACH__
 #include <mach/machine/vm_param.h>
     .align PAGE_MAX_SHIFT
+.globl CNAME(ffi_closure_trampoline_table_page)
+FFI_HIDDEN(CNAME(ffi_closure_trampoline_table_page))
+#ifdef __ELF__
+	.type	CNAME(ffi_closure_trampoline_table_page), #function
+#endif
 CNAME(ffi_closure_trampoline_table_page):
     .rept PAGE_MAX_SIZE / FFI_TRAMPOLINE_SIZE
-    adr x16, -PAGE_MAX_SIZE
-    ldp x17, x16, [x16]
-    BR(x16)
+    adr PTR_REG(16), -PAGE_MAX_SIZE
+    ldp GP_REG(17), GP_REG(16), [PTR_REG(16)]
+    br PTR_REG(16)
 	nop		/* each entry in the trampoline config page is 2*sizeof(void*) so the trampoline itself cannot be smaller than 16 bytes */
     .endr
 
-    .globl CNAME(ffi_closure_trampoline_table_page)
-    FFI_HIDDEN(CNAME(ffi_closure_trampoline_table_page))
     #ifdef __ELF__
-    	.type	CNAME(ffi_closure_trampoline_table_page), #function
     	.size	CNAME(ffi_closure_trampoline_table_page), . - CNAME(ffi_closure_trampoline_table_page)
     #endif
 #endif
@@ -466,12 +524,17 @@ CNAME(ffi_closure_trampoline_table_page):
 
 #ifdef FFI_GO_CLOSURES
 	.align 4
+	.globl	CNAME(ffi_go_closure_SYSV_V)
+	FFI_HIDDEN(CNAME(ffi_go_closure_SYSV_V))
+#ifdef __ELF__
+	.type	CNAME(ffi_go_closure_SYSV_V), #function
+#endif
 CNAME(ffi_go_closure_SYSV_V):
 	cfi_startproc
-	stp     x29, x30, [sp, #-ffi_closure_SYSV_FS]!
+	stp     GP_REG(29), GP_REG(30), [sp, #-ffi_closure_SYSV_FS]!
 	cfi_adjust_cfa_offset (ffi_closure_SYSV_FS)
-	cfi_rel_offset (x29, 0)
-	cfi_rel_offset (x30, 8)
+	cfi_rel_offset (GP_REG(29), 0)
+	cfi_rel_offset (GP_REG(30), GP_REG_SIZE)
 
 	/* Save the argument passing vector registers.  */
 	stp     q0, q1, [sp, #16 + 0]
@@ -481,39 +544,38 @@ CNAME(ffi_go_closure_SYSV_V):
 	b	0f
 	cfi_endproc
 
-	.globl	CNAME(ffi_go_closure_SYSV_V)
-	FFI_HIDDEN(CNAME(ffi_go_closure_SYSV_V))
 #ifdef __ELF__
-	.type	CNAME(ffi_go_closure_SYSV_V), #function
 	.size	CNAME(ffi_go_closure_SYSV_V), . - CNAME(ffi_go_closure_SYSV_V)
 #endif
 
 	.align	4
-	cfi_startproc
-CNAME(ffi_go_closure_SYSV):
-	stp     x29, x30, [sp, #-ffi_closure_SYSV_FS]!
-	cfi_adjust_cfa_offset (ffi_closure_SYSV_FS)
-	cfi_rel_offset (x29, 0)
-	cfi_rel_offset (x30, 8)
-0:
-	mov     x29, sp
-
-	/* Save the argument passing core registers.  */
-	stp     x0, x1, [sp, #16 + 16*N_V_ARG_REG + 0]
-	stp     x2, x3, [sp, #16 + 16*N_V_ARG_REG + 16]
-	stp     x4, x5, [sp, #16 + 16*N_V_ARG_REG + 32]
-	stp     x6, x7, [sp, #16 + 16*N_V_ARG_REG + 48]
-
-	/* Load ffi_closure_inner arguments.  */
-	ldp	PTR_REG(0), PTR_REG(1), [x18, #PTR_SIZE]/* load cif, fn */
-	mov	x2, x18					/* load user_data */
-	b	.Ldo_closure
-	cfi_endproc
-
 	.globl	CNAME(ffi_go_closure_SYSV)
 	FFI_HIDDEN(CNAME(ffi_go_closure_SYSV))
 #ifdef __ELF__
 	.type	CNAME(ffi_go_closure_SYSV), #function
+#endif
+	cfi_startproc
+CNAME(ffi_go_closure_SYSV):
+	stp     GP_REG(29), GP_REG(30), [sp, #-ffi_closure_SYSV_FS]!
+	cfi_adjust_cfa_offset (ffi_closure_SYSV_FS)
+	cfi_rel_offset (GP_REG(29), 0)
+	cfi_rel_offset (GP_REG(30), GP_REG_SIZE)
+0:
+	mov     GP_REG(29), sp
+
+	/* Save the argument passing core registers.  */
+	stp     GP_REG(0), GP_REG(1), [sp, #16 + 16*N_V_ARG_REG + 0*GP_REG_SIZE]
+	stp     GP_REG(2), GP_REG(3), [sp, #16 + 16*N_V_ARG_REG + 2*GP_REG_SIZE]
+	stp     GP_REG(4), GP_REG(5), [sp, #16 + 16*N_V_ARG_REG + 4*GP_REG_SIZE]
+	stp     GP_REG(6), GP_REG(7), [sp, #16 + 16*N_V_ARG_REG + 6*GP_REG_SIZE]
+
+	/* Load ffi_closure_inner arguments.  */
+	ldp	PTR_REG(0), PTR_REG(1), [PTR_REG(18), #PTR_SIZE]/* load cif, fn */
+	mov	GP_REG(2), GP_REG(18)					/* load user_data */
+	b	.Ldo_closure
+	cfi_endproc
+
+#ifdef __ELF__
 	.size	CNAME(ffi_go_closure_SYSV), . - CNAME(ffi_go_closure_SYSV)
 #endif
 #endif /* FFI_GO_CLOSURES */

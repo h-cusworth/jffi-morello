@@ -50,9 +50,15 @@ typedef struct call_context
 #if ABI_FLEN
     ABI_FLOAT fa[8];
 #endif
-    size_t a[8];
+    uintptr_t a[8];
     /* used by the assembly code to in-place construct its own stack frame */
-    char frame[16];
+    struct {
+#if __SIZEOF_POINTER__ < 8
+        void* pad[2];
+#endif
+        void *saved_fp;
+        void *saved_ra;
+    } frame;
 } call_context;
 
 typedef struct call_builder
@@ -60,12 +66,13 @@ typedef struct call_builder
     call_context *aregs;
     int used_integer;
     int used_float;
-    size_t *used_stack;
+    uintptr_t *used_stack;
+    void *struct_stack;
 } call_builder;
 
 /* integer (not pointer) less than ABI XLEN */
 /* FFI_TYPE_INT does not appear to be used */
-#if __SIZEOF_POINTER__ == 8
+#if __riscv_xlen >= 64
 #define IS_INT(type) ((type) >= FFI_TYPE_UINT8 && (type) <= FFI_TYPE_SINT64)
 #else
 #define IS_INT(type) ((type) >= FFI_TYPE_UINT8 && (type) <= FFI_TYPE_SINT32)
@@ -130,7 +137,7 @@ static float_struct_info struct_passed_as_elements(call_builder *cb, ffi_type *t
 
 /* allocates a single register, float register, or XLEN-sized stack slot to a datum */
 static void marshal_atom(call_builder *cb, int type, void *data) {
-    size_t value = 0;
+    uintptr_t value = 0;
     switch (type) {
         case FFI_TYPE_UINT8: value = *(uint8_t *)data; break;
         case FFI_TYPE_SINT8: value = *(int8_t *)data; break;
@@ -139,11 +146,11 @@ static void marshal_atom(call_builder *cb, int type, void *data) {
         /* 32-bit quantities are always sign-extended in the ABI */
         case FFI_TYPE_UINT32: value = *(int32_t *)data; break;
         case FFI_TYPE_SINT32: value = *(int32_t *)data; break;
-#if __SIZEOF_POINTER__ == 8
+#if __riscv_xlen >= 64
         case FFI_TYPE_UINT64: value = *(uint64_t *)data; break;
         case FFI_TYPE_SINT64: value = *(int64_t *)data; break;
 #endif
-        case FFI_TYPE_POINTER: value = *(size_t *)data; break;
+        case FFI_TYPE_POINTER: value = *(uintptr_t *)data; break;
 
         /* float values may be recoded in an implementation-defined way
            by hardware conforming to 2.1 or earlier, so use asm to
@@ -169,7 +176,7 @@ static void marshal_atom(call_builder *cb, int type, void *data) {
 }
 
 static void unmarshal_atom(call_builder *cb, int type, void *data) {
-    size_t value;
+    uintptr_t value;
     switch (type) {
 #if ABI_FLEN >= 32
         case FFI_TYPE_FLOAT:
@@ -190,17 +197,17 @@ static void unmarshal_atom(call_builder *cb, int type, void *data) {
     }
 
     switch (type) {
-        case FFI_TYPE_UINT8: *(uint8_t *)data = value; break;
-        case FFI_TYPE_SINT8: *(uint8_t *)data = value; break;
-        case FFI_TYPE_UINT16: *(uint16_t *)data = value; break;
-        case FFI_TYPE_SINT16: *(uint16_t *)data = value; break;
-        case FFI_TYPE_UINT32: *(uint32_t *)data = value; break;
-        case FFI_TYPE_SINT32: *(uint32_t *)data = value; break;
-#if __SIZEOF_POINTER__ == 8
-        case FFI_TYPE_UINT64: *(uint64_t *)data = value; break;
-        case FFI_TYPE_SINT64: *(uint64_t *)data = value; break;
+        case FFI_TYPE_UINT8: *(uint8_t *)data = (uint8_t)value; break;
+        case FFI_TYPE_SINT8: *(uint8_t *)data = (uint8_t)value; break;
+        case FFI_TYPE_UINT16: *(uint16_t *)data = (uint16_t)value; break;
+        case FFI_TYPE_SINT16: *(uint16_t *)data = (uint16_t)value; break;
+        case FFI_TYPE_UINT32: *(uint32_t *)data = (uint32_t)value; break;
+        case FFI_TYPE_SINT32: *(uint32_t *)data = (uint32_t)value; break;
+#if __riscv_xlen >= 64
+        case FFI_TYPE_UINT64: *(uint64_t *)data = (uint64_t)value; break;
+        case FFI_TYPE_SINT64: *(uint64_t *)data = (uint64_t)value; break;
 #endif
-        case FFI_TYPE_POINTER: *(size_t *)data = value; break;
+        case FFI_TYPE_POINTER: *(uintptr_t *)data = value; break;
         default: FFI_ASSERT(0); break;
     }
 }
@@ -227,7 +234,9 @@ static void marshal(call_builder *cb, ffi_type *type, int var, void *data) {
 #endif
 
     if (type->size > 2 * __SIZEOF_POINTER__) {
-        /* pass by reference */
+        /* copy to stack and pass by reference */
+        data = memcpy (cb->struct_stack, data, type->size);
+        cb->struct_stack = (size_t *) FFI_ALIGN ((char *) cb->struct_stack + type->size, __SIZEOF_POINTER__);
         marshal_atom(cb, FFI_TYPE_POINTER, &data);
     } else if (IS_INT(type->type) || type->type == FFI_TYPE_POINTER) {
         marshal_atom(cb, type->type, data);
@@ -239,7 +248,7 @@ static void marshal(call_builder *cb, ffi_type *type, int var, void *data) {
         if (type->alignment > __SIZEOF_POINTER__) {
             if (var)
                 cb->used_integer = FFI_ALIGN(cb->used_integer, 2);
-            cb->used_stack = (size_t *)FFI_ALIGN(cb->used_stack, 2*__SIZEOF_POINTER__);
+            cb->used_stack = (uintptr_t *)FFI_ALIGN(cb->used_stack, 2*__SIZEOF_POINTER__);
         }
 
         memcpy(realign, data, type->size);
@@ -287,7 +296,7 @@ static void *unmarshal(call_builder *cb, ffi_type *type, int var, void *data) {
         if (type->alignment > __SIZEOF_POINTER__) {
             if (var)
                 cb->used_integer = FFI_ALIGN(cb->used_integer, 2);
-            cb->used_stack = (size_t *)FFI_ALIGN(cb->used_stack, 2*__SIZEOF_POINTER__);
+            cb->used_stack = (uintptr_t *)FFI_ALIGN(cb->used_stack, 2*__SIZEOF_POINTER__);
         }
 
         if (type->size > 0)
@@ -334,21 +343,23 @@ ffi_call_int (ffi_cif *cif, void (*fn) (void), void *rvalue, void **avalue,
     /* this is a conservative estimate, assuming a complex return value and
        that all remaining arguments are long long / __int128 */
     size_t arg_bytes = cif->nargs <= 3 ? 0 :
-        FFI_ALIGN(2 * sizeof(size_t) * (cif->nargs - 3), STKALIGN);
+        FFI_ALIGN(2 * sizeof(uintptr_t) * (cif->nargs - 3), STKALIGN);
+    /* Allocate space for copies of big structures.  */
+    size_t struct_bytes = FFI_ALIGN (cif->bytes, STKALIGN);
     size_t rval_bytes = 0;
     if (rvalue == NULL && cif->rtype->size > 2*__SIZEOF_POINTER__)
         rval_bytes = FFI_ALIGN(cif->rtype->size, STKALIGN);
-    size_t alloc_size = arg_bytes + rval_bytes + sizeof(call_context);
+    size_t alloc_size = arg_bytes + rval_bytes + struct_bytes + sizeof(call_context);
 
     /* the assembly code will deallocate all stack data at lower addresses
        than the argument region, so we need to allocate the frame and the
        return value after the arguments in a single allocation */
-    size_t alloc_base;
+    char* alloc_base;
     /* Argument region must be 16-byte aligned */
     if (_Alignof(max_align_t) >= STKALIGN) {
         /* since sizeof long double is normally 16, the compiler will
            guarantee alloca alignment to at least that much */
-        alloc_base = (size_t)alloca(alloc_size);
+        alloc_base = alloca(alloc_size);
     } else {
         alloc_base = FFI_ALIGN(alloca(alloc_size + STKALIGN - 1), STKALIGN);
     }
@@ -358,8 +369,14 @@ ffi_call_int (ffi_cif *cif, void (*fn) (void), void *rvalue, void **avalue,
 
     call_builder cb;
     cb.used_float = cb.used_integer = 0;
-    cb.aregs = (call_context*)(alloc_base + arg_bytes + rval_bytes);
+    cb.aregs = (call_context*)(alloc_base + arg_bytes + rval_bytes + struct_bytes);
+#ifdef __CHERI_PURE_CAPABILITY__
+    cb.aregs = __builtin_cheri_bounds_set(cb.aregs, sizeof(*cb.aregs));
+#endif
+    /* Initialize the frame with 0xaa to detect errors. */
+    memset(cb.aregs, 0xaa, sizeof(*cb.aregs));
     cb.used_stack = (void*)alloc_base;
+    cb.struct_stack = (void *) (alloc_base + arg_bytes + rval_bytes);
 
     int return_by_ref = passed_by_ref(&cb, cif->rtype, 0);
     if (return_by_ref)
@@ -369,11 +386,41 @@ ffi_call_int (ffi_cif *cif, void (*fn) (void), void *rvalue, void **avalue,
     for (i = 0; i < cif->nargs; i++)
         marshal(&cb, cif->arg_types[i], i >= cif->riscv_nfixedargs, avalue[i]);
 
+    /* Start using the stack from the beginning of the alloca() used for
+     * arguments. We have to restore the original stack bounds so that the
+     * called function has a valid stack instead of an out-of-bounds pointer. */
+    alloc_base = __builtin_cheri_address_set(__builtin_cheri_stack_get(),
+                                             (ptraddr_t)alloc_base);
     ffi_call_asm ((void *) alloc_base, cb.aregs, fn, closure);
 
     cb.used_float = cb.used_integer = 0;
     if (!return_by_ref && rvalue)
-        unmarshal(&cb, cif->rtype, 0, rvalue);
+      {
+	if (IS_INT(cif->rtype->type)
+	    && cif->rtype->size < sizeof (ffi_arg))
+	  {
+	    /* Integer types smaller than ffi_arg need to be extended.  */
+	    switch (cif->rtype->type)
+	      {
+	      case FFI_TYPE_SINT8:
+	      case FFI_TYPE_SINT16:
+	      case FFI_TYPE_SINT32:
+		unmarshal_atom (&cb, (sizeof (ffi_arg) > 4
+				      ? FFI_TYPE_SINT64 : FFI_TYPE_SINT32),
+				rvalue);
+		break;
+	      case FFI_TYPE_UINT8:
+	      case FFI_TYPE_UINT16:
+	      case FFI_TYPE_UINT32:
+		unmarshal_atom (&cb, (sizeof (ffi_arg) > 4
+				      ? FFI_TYPE_UINT64 : FFI_TYPE_UINT32),
+				rvalue);
+		break;
+	      }
+	  }
+	else
+	  unmarshal(&cb, cif->rtype, 0, rvalue);
+      }
 }
 
 void
@@ -403,10 +450,18 @@ ffi_status ffi_prep_closure_loc(ffi_closure *closure, ffi_cif *cif, void (*fun)(
        as the memory is readable it should work */
 
     tramp[0] = 0x00000317; /* auipc t1, 0 (i.e. t0 <- codeloc) */
+#ifdef __CHERI_PURE_CAPABILITY__
+#if __riscv_xlen == 64
+    tramp[1] = 0x0103238f; /* RV64: clc ct2, 16(ct1) */
+#else
+    tramp[1] = 0x01033383; /* RV32: clc ct2, 16(ct1) */
+#endif
+#else
 #if __SIZEOF_POINTER__ == 8
     tramp[1] = 0x01033383; /* ld t2, 16(t1) */
 #else
     tramp[1] = 0x01032383; /* lw t2, 16(t1) */
+#endif
 #endif
     tramp[2] = 0x00038067; /* jr t2 */
     tramp[3] = 0x00000013; /* nop */
@@ -417,7 +472,9 @@ ffi_status ffi_prep_closure_loc(ffi_closure *closure, ffi_cif *cif, void (*fun)(
     closure->fun = fun;
     closure->user_data = user_data;
 
+#if !defined(__FreeBSD__)
     __builtin___clear_cache(codeloc, codeloc + FFI_TRAMPOLINE_SIZE);
+#endif
 
     return FFI_OK;
 }
@@ -445,7 +502,7 @@ void FFI_HIDDEN
 ffi_closure_inner (ffi_cif *cif,
 		   void (*fun) (ffi_cif *, void *, void **, void *),
 		   void *user_data,
-		   size_t *stack, call_context *aregs)
+		   uintptr_t *stack, call_context *aregs)
 {
     void **avalue = alloca(cif->nargs * sizeof(void*));
     /* storage for arguments which will be copied by unmarshal().  We could

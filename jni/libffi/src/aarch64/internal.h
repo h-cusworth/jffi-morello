@@ -22,7 +22,7 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.  */
 #define AARCH64_RET_INT64	1
 #define AARCH64_RET_INT128	2
 
-#define AARCH64_RET_UNUSED3	3
+#define AARCH64_RET_POINTER	3
 #define AARCH64_RET_UNUSED4	4
 #define AARCH64_RET_UNUSED5	5
 #define AARCH64_RET_UNUSED6	6
@@ -64,8 +64,14 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.  */
 #define AARCH64_FLAG_VARARG	(1 << 8)
 
 #define N_X_ARG_REG		8
+#ifdef __CHERI_PURE_CAPABILITY__
+#define X_REG_SIZE 16
+#else
+#define X_REG_SIZE 8
+#endif
 #define N_V_ARG_REG		8
-#define CALL_CONTEXT_SIZE	(N_V_ARG_REG * 16 + N_X_ARG_REG * 8)
+#define CALL_CONTEXT_SIZE	(N_V_ARG_REG * 16 + N_X_ARG_REG * X_REG_SIZE)
+#define CALL_FRAME_SIZE		(5 * X_REG_SIZE)
 
 #if defined(FFI_EXEC_STATIC_TRAMP)
 /*
@@ -75,4 +81,33 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.  */
 #define AARCH64_TRAMP_MAP_SHIFT	14
 #define AARCH64_TRAMP_MAP_SIZE	(1 << AARCH64_TRAMP_MAP_SHIFT)
 #define AARCH64_TRAMP_SIZE	32
+
+#endif
+
+/* Helpers for writing assembly compatible with arm ptr auth */
+#ifdef LIBFFI_ASM
+
+#ifdef HAVE_PTRAUTH
+#ifdef __CHERI_PURE_CAPABILITY__
+#error "HAVE_PTRAUTH is not compatible"
+#endif
+#define SIGN_LR pacibsp
+#define SIGN_LR_WITH_REG(x) pacib lr, x
+#define AUTH_LR_AND_RET retab
+#define AUTH_LR_WITH_REG(x) autib lr, x
+#define BRANCH_AND_LINK_TO_REG blraaz
+#define BRANCH_TO_REG braaz
+#else
+#define SIGN_LR
+#define SIGN_LR_WITH_REG(x)
+#ifdef __CHERI_PURE_CAPABILITY__
+#define AUTH_LR_AND_RET ret c30
+#else
+#define AUTH_LR_AND_RET ret
+#endif
+#define AUTH_LR_WITH_REG(x)
+#define BRANCH_AND_LINK_TO_REG blr
+#define BRANCH_TO_REG br
+#endif
+
 #endif

@@ -20,6 +20,7 @@ TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
 SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.  */
 
 #if defined(__aarch64__) || defined(__arm64__)|| defined (_M_ARM64)
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -54,10 +55,25 @@ struct _v
   union _d d[2] __attribute__((aligned(16)));
 };
 
+#ifdef __CHERI_PURE_CAPABILITY__
+typedef uintptr_t XREG;
+#else
+typedef uint64_t XREG;
+#endif
+
 struct call_context
 {
   struct _v v[N_V_ARG_REG];
-  UINT64 x[N_X_ARG_REG];
+  XREG x[N_X_ARG_REG];
+};
+
+struct call_frame
+{
+  XREG lr;
+  XREG fp;
+  XREG rvalue;
+  XREG flags;
+  XREG sp;
 };
 
 #if FFI_EXEC_TRAMPOLINE_TABLE
@@ -248,13 +264,18 @@ is_vfp_type (const ffi_type *ty)
    state.
 
    The terse state variable names match the names used in the AARCH64
-   PCS. */
+   PCS.
+
+   The struct area is allocated downwards from the top of the argument
+   area.  It is used to hold copies of structures passed by value that are
+   bigger than 16 bytes.  */
 
 struct arg_state
 {
   unsigned ngrn;                /* Next general-purpose register number. */
   unsigned nsrn;                /* Next vector register number. */
   size_t nsaa;                  /* Next stack offset. */
+  size_t next_struct_area;	/* Place to allocate big structs. */
 
 #if defined (__APPLE__)
   unsigned allocating_variadic;
@@ -263,11 +284,12 @@ struct arg_state
 
 /* Initialize a procedure call argument marshalling state.  */
 static void
-arg_init (struct arg_state *state)
+arg_init (struct arg_state *state, size_t size)
 {
   state->ngrn = 0;
   state->nsrn = 0;
   state->nsaa = 0;
+  state->next_struct_area = size;
 #if defined (__APPLE__)
   state->allocating_variadic = 0;
 #endif
@@ -289,41 +311,125 @@ allocate_to_stack (struct arg_state *state, void *stack,
   if (alignment < 8)
     alignment = 8;
 #endif
-    
+
   nsaa = FFI_ALIGN (nsaa, alignment);
   state->nsaa = nsaa + size;
 
   return (char *)stack + nsaa;
 }
 
+/* Allocate and copy a structure that is passed by value on the stack and
+   return a pointer to it.  */
+static void *
+allocate_and_copy_struct_to_stack (struct arg_state *state, void *stack,
+				   size_t alignment, size_t size, void *value)
+{
+  size_t dest = state->next_struct_area - size;
+
+  /* Round down to the natural alignment of the value.  */
+  dest = FFI_ALIGN_DOWN (dest, alignment);
+  state->next_struct_area = dest;
+
+  return memcpy ((char *) stack + dest, value, size);
+}
+
 static ffi_arg
-extend_integer_type (void *source, int type)
+extend_integer_type (uintptr_t *source, int type)
 {
   switch (type)
     {
     case FFI_TYPE_UINT8:
-      return *(UINT8 *) source;
+      {
+        UINT8 u8;
+        memcpy (&u8, source, sizeof (u8));
+        return u8;
+      }
     case FFI_TYPE_SINT8:
-      return *(SINT8 *) source;
+      {
+        SINT8 s8;
+        memcpy (&s8, source, sizeof (s8));
+        return s8;
+      }
     case FFI_TYPE_UINT16:
-      return *(UINT16 *) source;
+      {
+        UINT16 u16;
+        memcpy (&u16, source, sizeof (u16));
+        return u16;
+      }
     case FFI_TYPE_SINT16:
-      return *(SINT16 *) source;
+      {
+        SINT16 s16;
+        memcpy (&s16, source, sizeof (s16));
+        return s16;
+      }
     case FFI_TYPE_UINT32:
-      return *(UINT32 *) source;
+      {
+        UINT32 u32;
+        memcpy (&u32, source, sizeof (u32));
+        return u32;
+      }
     case FFI_TYPE_INT:
     case FFI_TYPE_SINT32:
-      return *(SINT32 *) source;
+      {
+        SINT32 s32;
+        memcpy (&s32, source, sizeof (s32));
+        return s32;
+      }
     case FFI_TYPE_UINT64:
     case FFI_TYPE_SINT64:
-      return *(UINT64 *) source;
-      break;
+      {
+        UINT64 u64;
+        memcpy (&u64, source, sizeof (u64));
+        return u64;
+      }
     case FFI_TYPE_POINTER:
-      return *(uintptr_t *) source;
+      {
+        uintptr_t uptr;
+        memcpy (&uptr, source, sizeof (uptr));
+        return uptr;
+      }
     default:
       abort();
     }
 }
+
+static inline bool
+can_pass_aggregate_in_xregs (ffi_type *ty, size_t *num_xregs,
+			     size_t *num_cheri_caps)
+{
+  FFI_ASSERT (ty->elements != NULL);
+  if (ty->size > 2 * X_REG_SIZE)
+    return false;
+  *num_xregs = 0;
+  *num_cheri_caps = 0;
+#ifdef __CHERI_PURE_CAPABILITY__
+  /* For CHERI up to 32 bytes can be okay if we have either 2 caps, or one
+   * capability + (multiple) integers < 8 bytes. */
+  for (int i = 0; ty->elements[i]; i++)
+    {
+      if (ty->elements[i]->type == FFI_TYPE_STRUCT)
+	abort (); /* TODO: should recurse into structs to flatten them. */
+      else if (ty->elements[i]->type == FFI_TYPE_POINTER)
+	(*num_cheri_caps)++;
+      else if (ty->elements[i]->size > 8)
+	return false; /* can't pass cap+int128 in registers */
+    }
+  FFI_ASSERT (*num_cheri_caps <= 2);
+  /* If there are no capabilities, we can only return 16 bytes in xregs. */
+  if (*num_cheri_caps == 0 && ty->size > 16)
+    return false;
+#endif
+  *num_xregs
+      = *num_cheri_caps + ((ty->size - *num_cheri_caps * X_REG_SIZE) + 7) / 8;
+  FFI_ASSERT (*num_xregs <= 2);
+  return true;
+}
+
+#ifdef __CHERI_PURE_CAPABILITY__
+#define PTR_CONSTR "C"
+#else
+#define PTR_CONSTR "r"
+#endif
 
 #if defined(_MSC_VER)
 void extend_hfa_type (void *dest, void *src, int h);
@@ -335,7 +441,11 @@ extend_hfa_type (void *dest, void *src, int h)
   void *x0;
 
   asm volatile (
+#ifdef __CHERI_PURE_CAPABILITY__
+	"adr	%0, 0f+1\n" /* +1 is needed to stay in C64 mode */
+#else
 	"adr	%0, 0f\n"
+#endif
 "	add	%0, %0, %1\n"
 "	br	%0\n"
 "0:	ldp	s16, s17, [%3]\n"	/* S4 */
@@ -377,8 +487,8 @@ extend_hfa_type (void *dest, void *src, int h)
 "3:	str	q18, [%2, #32]\n"
 "2:	str	q17, [%2, #16]\n"
 "1:	str	q16, [%2]"
-    : "=&r"(x0)
-    : "r"(f * 12), "r"(dest), "r"(src)
+    : "=&" PTR_CONSTR (x0)
+    : "r"(f * 12), PTR_CONSTR(dest), PTR_CONSTR(src)
     : "memory", "v16", "v17", "v18", "v19");
 }
 #endif
@@ -404,19 +514,19 @@ compress_hfa_type (void *dest, void *reg, int h)
     case AARCH64_RET_S2:
       asm ("ldp q16, q17, [%1]\n\t"
 	   "st2 { v16.s, v17.s }[0], [%0]"
-	   : : "r"(dest), "r"(reg) : "memory", "v16", "v17");
+	   : : PTR_CONSTR(dest), PTR_CONSTR(reg) : "memory", "v16", "v17");
       break;
     case AARCH64_RET_S3:
       asm ("ldp q16, q17, [%1]\n\t"
 	   "ldr q18, [%1, #32]\n\t"
 	   "st3 { v16.s, v17.s, v18.s }[0], [%0]"
-	   : : "r"(dest), "r"(reg) : "memory", "v16", "v17", "v18");
+	   : : PTR_CONSTR(dest), PTR_CONSTR(reg) : "memory", "v16", "v17", "v18");
       break;
     case AARCH64_RET_S4:
       asm ("ldp q16, q17, [%1]\n\t"
 	   "ldp q18, q19, [%1, #32]\n\t"
 	   "st4 { v16.s, v17.s, v18.s, v19.s }[0], [%0]"
-	   : : "r"(dest), "r"(reg) : "memory", "v16", "v17", "v18", "v19");
+	   : : PTR_CONSTR(dest), PTR_CONSTR(reg) : "memory", "v16", "v17", "v18", "v19");
       break;
 
     case AARCH64_RET_D1:
@@ -432,19 +542,19 @@ compress_hfa_type (void *dest, void *reg, int h)
     case AARCH64_RET_D2:
       asm ("ldp q16, q17, [%1]\n\t"
 	   "st2 { v16.d, v17.d }[0], [%0]"
-	   : : "r"(dest), "r"(reg) : "memory", "v16", "v17");
+	   : : PTR_CONSTR(dest), PTR_CONSTR(reg) : "memory", "v16", "v17");
       break;
     case AARCH64_RET_D3:
       asm ("ldp q16, q17, [%1]\n\t"
 	   "ldr q18, [%1, #32]\n\t"
 	   "st3 { v16.d, v17.d, v18.d }[0], [%0]"
-	   : : "r"(dest), "r"(reg) : "memory", "v16", "v17", "v18");
+	   : : PTR_CONSTR(dest), PTR_CONSTR(reg) : "memory", "v16", "v17", "v18");
       break;
     case AARCH64_RET_D4:
       asm ("ldp q16, q17, [%1]\n\t"
 	   "ldp q18, q19, [%1, #32]\n\t"
 	   "st4 { v16.d, v17.d, v18.d, v19.d }[0], [%0]"
-	   : : "r"(dest), "r"(reg) : "memory", "v16", "v17", "v18", "v19");
+	   : : PTR_CONSTR(dest), PTR_CONSTR(reg) : "memory", "v16", "v17", "v18", "v19");
       break;
 
     default:
@@ -508,7 +618,7 @@ ffi_prep_cif_machdep (ffi_cif *cif)
       flags = AARCH64_RET_INT64;
       break;
     case FFI_TYPE_POINTER:
-      flags = (sizeof(void *) == 4 ? AARCH64_RET_UINT32 : AARCH64_RET_INT64);
+      flags = (sizeof(void *) == 4 ? AARCH64_RET_UINT32 : AARCH64_RET_POINTER);
       break;
 
     case FFI_TYPE_FLOAT:
@@ -586,7 +696,8 @@ ffi_call_int (ffi_cif *cif, void (*fn)(void), void *orig_rvalue,
 	      void **avalue, void *closure)
 {
   struct call_context *context;
-  void *stack, *frame, *rvalue;
+  struct call_frame *frame;
+  void *stack, *rvalue;
   struct arg_state state;
   size_t stack_bytes, rtype_size, rsize;
   int i, nargs, flags, isvariadic = 0;
@@ -617,19 +728,44 @@ ffi_call_int (ffi_cif *cif, void (*fn)(void), void *orig_rvalue,
   else if (flags & AARCH64_RET_NEED_COPY)
     rsize = 16;
 
-  /* Allocate consectutive stack for everything we'll need.  */
-  context = alloca (sizeof(struct call_context) + stack_bytes + 32 + rsize);
+  /* Allocate consectutive stack for everything we'll need.
+     The frame uses 40/80 bytes for: lr, fp, rvalue, flags, sp */
+  context = alloca (sizeof(struct call_context) + stack_bytes + sizeof(struct call_frame) + rsize);
+  _Static_assert(sizeof(struct call_context) == CALL_CONTEXT_SIZE, "");
+  _Static_assert(sizeof(struct call_frame) == CALL_FRAME_SIZE, "");
   stack = context + 1;
+#ifdef __CHERI_PURE_CAPABILITY__
+  /*
+   * context is bounded to the alloca size, we want to pass a pointer that
+   * points just after the alloca with the curretn stack bounds.
+   */
+  stack = __builtin_cheri_address_set(__builtin_cheri_stack_get(), (ptraddr_t)stack);
+#endif
   frame = (void*)((uintptr_t)stack + (uintptr_t)stack_bytes);
-  rvalue = (rsize ? (void*)((uintptr_t)frame + 32) : orig_rvalue);
+  /* Initialize the frame with 0xaa to detect errors. */
+  memset(context, 0xaa, sizeof(*context));
+  memset(frame, 0xaa, sizeof(*frame));
+  if (rsize) {
+    /* frame currently has full stack bounds, so we can use it for derivation. */
+    rvalue = (void*)((uintptr_t)frame + sizeof(struct call_frame));
+#ifdef __CHERI_PURE_CAPABILITY__
+    rvalue = __builtin_cheri_bounds_set(rvalue, rsize);
+#endif
+  } else {
+    rvalue = orig_rvalue;
+  }
+#ifdef __CHERI_PURE_CAPABILITY__
+  frame = __builtin_cheri_bounds_set(frame, sizeof(*frame));
+#endif
 
-  arg_init (&state);
+  arg_init (&state, stack_bytes);
   for (i = 0, nargs = cif->nargs; i < nargs; i++)
     {
       ffi_type *ty = cif->arg_types[i];
       size_t s = ty->size;
-      void *a = avalue[i];
+      uintptr_t *a = avalue[i];
       int h, t;
+      void *dest;
 
       t = ty->type;
       switch (t)
@@ -665,7 +801,14 @@ ffi_call_int (ffi_cif *cif, void (*fn)(void), void *orig_rvalue,
 #ifdef __APPLE__
 		memcpy(d, a, s);
 #else
-		*(ffi_arg *)d = ext;
+		/* Integers are extended to uint64_t, but for Morello pointers
+		 * are be 16 bytes, so we have to use uintptr_t/ffi_arg. */
+		if (t == FFI_TYPE_POINTER) {
+		  FFI_ASSERT(s == sizeof(void*));
+		  *(uintptr_t *)d = ext;
+		} else {
+		  *(uint64_t *)d = (uint64_t)ext;
+		}
 #endif
 	      }
 	  }
@@ -677,7 +820,8 @@ ffi_call_int (ffi_cif *cif, void (*fn)(void), void *orig_rvalue,
 	case FFI_TYPE_STRUCT:
 	case FFI_TYPE_COMPLEX:
 	  {
-	    void *dest;
+	    size_t num_capabilities = 0;
+	    size_t num_xregs = 0;
 
 	    h = is_vfp_type (ty);
 	    if (h)
@@ -708,27 +852,52 @@ ffi_call_int (ffi_cif *cif, void (*fn)(void), void *orig_rvalue,
                 dest = allocate_to_stack (&state, stack, ty->alignment, s);
               }
 	      }
-	    else if (s > 16)
+	    else if (!can_pass_aggregate_in_xregs (ty, &num_xregs,
+						   &num_capabilities))
 	      {
 		/* If the argument is a composite type that is larger than 16
-		   bytes, then the argument has been copied to memory, and
+		   bytes, then the argument is copied to memory, and
 		   the argument is replaced by a pointer to the copy.  */
-		a = &avalue[i];
+		dest = allocate_and_copy_struct_to_stack (&state, stack,
+							  ty->alignment, s,
+							  avalue[i]);
+		a = (uintptr_t *)&dest;
 		t = FFI_TYPE_POINTER;
 		s = sizeof (void *);
 		goto do_pointer;
 	      }
 	    else
 	      {
-		size_t n = (s + 7) / 8;
-		if (state.ngrn + n <= N_X_ARG_REG)
+		if (state.ngrn + num_xregs <= N_X_ARG_REG)
 		  {
+		    /* If the struct type does not contain capabilities, we
+		     * have to pass two separate 8-byte chunks since context->x
+		     * contains 16-byte registers */
+		    if (num_capabilities == 0)
+		      {
+			FFI_ASSERT (num_xregs == (s + 7) / 8);
+			for (int offset = 0; offset < s; offset += 8)
+			  {
+			    uint64_t tmp = 0;
+			    memcpy (&tmp, (uint8_t *)a + offset,
+				    s - offset > 8 ? 8 : s - offset);
+			    context->x[state.ngrn] = tmp;
+			    state.ngrn++;
+			  }
+			break; /* copy already completed */
+		      }
 		    /* If the argument is a composite type and the size in
 		       double-words is not more than the number of available
 		       X registers, then the argument is copied into
-		       consecutive X registers.  */
-		    dest = &context->x[state.ngrn];
-                    state.ngrn += (unsigned int)n;
+		       consecutive X registers.
+		       NB: If the struct contains capabilities, the layout is
+		       padded appropriately, so we can do a simple memcpy().
+		       */
+		    else
+		      {
+			dest = &context->x[state.ngrn];
+			state.ngrn += num_xregs;
+		      }
 		  }
 		else
 		  {
@@ -797,25 +966,25 @@ ffi_prep_closure_loc (ffi_closure *closure,
                       void *user_data,
                       void *codeloc)
 {
-  if (cif->abi != FFI_SYSV)
+  if (cif->abi != FFI_SYSV && cif->abi != FFI_WIN64)
     return FFI_BAD_ABI;
 
   void (*start)(void);
-  
+
   if (cif->flags & AARCH64_FLAG_ARG_V)
     start = ffi_closure_SYSV_V;
   else
     start = ffi_closure_SYSV;
 
 #if FFI_EXEC_TRAMPOLINE_TABLE
-#ifdef __MACH__
-#ifdef HAVE_PTRAUTH
-  codeloc = ptrauth_strip (codeloc, ptrauth_key_asia);
-#endif
+# ifdef __MACH__
+#  ifdef HAVE_PTRAUTH
+  codeloc = ptrauth_auth_data(codeloc, ptrauth_key_function_pointer, 0);
+#  endif
   void **config = (void **)((uint8_t *)codeloc - PAGE_MAX_SIZE);
   config[0] = closure;
   config[1] = start;
-#endif
+# endif
 #else
   static const unsigned char trampoline[16] = {
     0x90, 0x00, 0x00, 0x58,	/* ldr	x16, tramp+16	*/
@@ -824,7 +993,7 @@ ffi_prep_closure_loc (ffi_closure *closure,
   };
   char *tramp = closure->tramp;
 
-#if defined(FFI_EXEC_STATIC_TRAMP)
+# if defined(FFI_EXEC_STATIC_TRAMP)
   if (ffi_tramp_is_present(closure))
     {
       /* Initialize the static trampoline's parameters. */
@@ -835,25 +1004,28 @@ ffi_prep_closure_loc (ffi_closure *closure,
       ffi_tramp_set_parms (closure->ftramp, start, closure);
       goto out;
     }
-#endif
+# endif
 
   /* Initialize the dynamic trampoline. */
   memcpy (tramp, trampoline, sizeof(trampoline));
-  
-  *(UINT64 *)(tramp + 16) = (uintptr_t)start;
+
+  *(XREG *)(tramp + 16) = (uintptr_t)start;
 
   ffi_clear_cache(tramp, tramp + FFI_TRAMPOLINE_SIZE);
+  _Static_assert(FFI_TRAMPOLINE_SIZE == 16 + sizeof(XREG), "");
 
   /* Also flush the cache for code mapping.  */
-#ifdef _WIN32
+# ifdef _WIN32
   // Not using dlmalloc.c for Windows ARM64 builds
   // so calling ffi_data_to_code_pointer() isn't necessary
   unsigned char *tramp_code = tramp;
-  #else
+# else
   unsigned char *tramp_code = ffi_data_to_code_pointer (tramp);
-  #endif
+# endif
   ffi_clear_cache (tramp_code, tramp_code + FFI_TRAMPOLINE_SIZE);
+# if defined(FFI_EXEC_STATIC_TRAMP)
 out:
+# endif
 #endif
 
   closure->cif = cif;
@@ -873,7 +1045,7 @@ ffi_prep_go_closure (ffi_go_closure *closure, ffi_cif* cif,
 {
   void (*start)(void);
 
-  if (cif->abi != FFI_SYSV)
+  if (cif->abi != FFI_SYSV && cif->abi != FFI_WIN64)
     return FFI_BAD_ABI;
 
   if (cif->flags & AARCH64_FLAG_ARG_V)
@@ -913,10 +1085,17 @@ ffi_closure_SYSV_inner (ffi_cif *cif,
 			void *stack, void *rvalue, void *struct_rvalue)
 {
   void **avalue = (void**) alloca (cif->nargs * sizeof (void*));
-  int i, h, nargs, flags;
+  int i, h, nargs, flags, isvariadic = 0;
   struct arg_state state;
 
-  arg_init (&state);
+  arg_init (&state, cif->bytes);
+
+  flags = cif->flags;
+  if (flags & AARCH64_FLAG_VARARG)
+  {
+    isvariadic = 1;
+    flags &= ~AARCH64_FLAG_VARARG;
+  }
 
   for (i = 0, nargs = cif->nargs; i < nargs; i++)
     {
@@ -952,14 +1131,13 @@ ffi_closure_SYSV_inner (ffi_cif *cif,
 	  if (h)
 	    {
 	      n = 4 - (h & 3);
-#ifdef _WIN32  /* for handling armasm calling convention */
-              if (cif->is_variadic)
+              if (cif->abi == FFI_WIN64 && isvariadic)
                 {
                   if (state.ngrn + n <= N_X_ARG_REG)
                     {
                       void *reg = &context->x[state.ngrn];
                       state.ngrn += (unsigned int)n;
-    
+
                       /* Eeek! We need a pointer to the structure, however the
                        homogeneous float elements are being passed in individual
                        registers, therefore for float and double the structure
@@ -979,7 +1157,6 @@ ffi_closure_SYSV_inner (ffi_cif *cif,
                 }
               else
                 {
-#endif  /* for handling armasm calling convention */
                   if (state.nsrn + n <= N_V_ARG_REG)
                     {
                       void *reg = &context->v[state.nsrn];
@@ -992,17 +1169,24 @@ ffi_closure_SYSV_inner (ffi_cif *cif,
                       avalue[i] = allocate_to_stack(&state, stack,
                                                    ty->alignment, s);
                     }
-#ifdef _WIN32  /* for handling armasm calling convention */
                 }
-#endif  /* for handling armasm calling convention */
             }
           else if (s > 16)
             {
               /* Replace Composite type of size greater than 16 with a
                   pointer.  */
+#ifdef __ILP32__
+             UINT64 avalue_tmp;
+             memcpy (&avalue_tmp,
+                  allocate_int_to_reg_or_stack (context, &state,
+                                               stack, sizeof (void *)),
+                  sizeof (UINT64));
+             avalue[i] = (void *)(UINT32)avalue_tmp;
+#else
               avalue[i] = *(void **)
               allocate_int_to_reg_or_stack (context, &state, stack,
                                          sizeof (void *));
+#endif
             }
           else
             {
@@ -1035,7 +1219,6 @@ ffi_closure_SYSV_inner (ffi_cif *cif,
 #endif
     }
 
-  flags = cif->flags;
   if (flags & AARCH64_RET_IN_MEM)
     rvalue = struct_rvalue;
 
