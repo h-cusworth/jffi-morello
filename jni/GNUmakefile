@@ -75,15 +75,6 @@ PICFLAGS = -fPIC
 SOFLAGS = # Filled in for each OS specifically
 FFI_MMAP_EXEC = -DFFI_MMAP_EXEC_WRIT
 
-PROCESSOR := $(shell uname -p )
-ifeq ($(PROCESSOR), aarch64c)
-    PURECAP_CFLAGS = -march=morello+c64 -mabi=purecap -I/usr/local/include
-    LDFLAGS += -mabi=purecap -fuse-ld=lld -L/usr/local/lib -lffi
-    LIBFFI_CFLAGS += $(PURECAP_CFLAGS)
-    CC = clang-morello
-    LD_LIBRARY_PATH=/usr/local/lib
-endif
-
 FFI_CC = $(CCACHE) $(CC)
 FFI_LD = $(LD)
 FFI_CFLAGS = $(FFI_MMAP_EXEC) $(OFLAGS) $(PURECAP_CFLAGS)
