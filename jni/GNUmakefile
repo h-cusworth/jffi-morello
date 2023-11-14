@@ -41,8 +41,8 @@ JFFI_SRC_DIR = $(SRC_DIR)/jffi
 JFFI_BUILD_DIR = $(BUILD_DIR)/jffi
 
 ifeq ($(USE_SYSTEM_LIBFFI),1)
-  LIBFFI_LIBS ?= $(shell pkg-config --libs libffi)
-  LIBFFI_CFLAGS ?= $(shell pkg-config --cflags libffi)
+#   LIBFFI_LIBS ?= $(shell pkg-config --libs libffi)
+#   LIBFFI_CFLAGS ?= $(shell pkg-config --cflags libffi)
 else
   LIBFFI_SRC_DIR = $(SRC_DIR)/libffi
   LIBFFI_BUILD_DIR = $(BUILD_DIR)/libffi-$(PLATFORM)
@@ -75,10 +75,21 @@ PICFLAGS = -fPIC
 SOFLAGS = # Filled in for each OS specifically
 FFI_MMAP_EXEC = -DFFI_MMAP_EXEC_WRIT
 
+PROCESSOR := $(shell uname -p )
+ifeq ($(PROCESSOR), aarch64c)
+    PURECAP_CFLAGS = -march=morello+c64 -mabi=purecap -I/usr/local/include
+    LDFLAGS += -mabi=purecap -fuse-ld=lld -L/usr/local/lib -lffi
+    LIBFFI_CFLAGS += $(PURECAP_CFLAGS)
+    CC = clang-morello
+    LD_LIBRARY_PATH=/usr/local/lib
+endif
+
 FFI_CC = $(CCACHE) $(CC)
 FFI_LD = $(LD)
-FFI_CFLAGS = $(FFI_MMAP_EXEC) $(OFLAGS)
+FFI_CFLAGS = $(FFI_MMAP_EXEC) $(OFLAGS) $(PURECAP_CFLAGS)
 STRIP ?= strip -S
+
+
 
 JDK_INCLUDES = -I"$(JDK_HOME)/include" -I"$(JDK_HOME)/include/$(OS)"
 IFLAGS = -I"$(BUILD_DIR)" -I"$(BUILD_DIR)"/jni -I$(SRC_DIR) -I"$(JFFI_SRC_DIR)"
@@ -265,6 +276,8 @@ ifdef CONFIGURE_BUILD
 	LIBFFI_CONFIGURE += --build=$(CONFIGURE_BUILD)
 endif
 
+
+
 all:	$(LIBJFFI)
 
 debug:
@@ -276,6 +289,13 @@ debug:
 	@echo "PLATFORM=$(PLATFORM)"
 	@echo "JFFI_BUILD_DIR=$(JFFI_BUILD_DIR)"
 	@echo "OBJS=$(OBJS)"
+	@echo "CC=$(CC)"
+	@echo "CFLAGS=$(CFLAGS)"
+	@echo "LIBFFI_CONFIGURE=$(LIBFFI_CONFIGURE)"
+	@echo "LIBFFI_CFLAGS=$(LIBFFI_CFLAGS)"
+	@echo "CCACHE=$(CCACHE)"
+	@echo "LD_LIBRARY_PATH=$(LD_LIBRARY_PATH)"
+
 
 $(LIBJFFI):  $(OBJS) $(LIBFFI_LIBS)
 	$(CC) -o $@ $(LDFLAGS) $(SOFLAGS) $(OBJS) $(LIBFFI) $(LIBS)
@@ -286,10 +306,13 @@ endif
 
 $(BUILD_DIR)/%.o : $(SRC_DIR)/%.c $(wildcard $(JFFI_SRC_DIR)/*.h)
 	@mkdir -p $(@D)
+	@echo BEANSSS1
+	@echo $(CCACHE) $(CC) $(CFLAGS) -c $< -o $@
 	@$(CCACHE) $(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/%.o : $(SRC_DIR)/%.S $(wildcard $(JFFI_SRC_DIR)/*.h)
 	@mkdir -p $(@D)
+	@echo BEANSSS2
 	@$(CC) $(CFLAGS) -o $@ -c $<
 
 $(OBJS) : $(LIBFFI)
