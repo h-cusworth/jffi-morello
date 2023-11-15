@@ -297,13 +297,10 @@ endif
 
 $(BUILD_DIR)/%.o : $(SRC_DIR)/%.c $(wildcard $(JFFI_SRC_DIR)/*.h)
 	@mkdir -p $(@D)
-	@echo BEANSSS1
-	@echo $(CCACHE) $(CC) $(CFLAGS) -c $< -o $@
 	@$(CCACHE) $(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/%.o : $(SRC_DIR)/%.S $(wildcard $(JFFI_SRC_DIR)/*.h)
 	@mkdir -p $(@D)
-	@echo BEANSSS2
 	@$(CC) $(CFLAGS) -o $@ -c $<
 
 $(OBJS) : $(LIBFFI)
