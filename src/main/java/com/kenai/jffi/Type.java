@@ -109,7 +109,7 @@ public abstract class Type {
     private int type = 0;
     private int size = 0;
     private int alignment = 0;
-    private volatile long handle = 0;
+    private volatile MemoryAddress handle = new MemoryAddress(0L);
 
     /**
      * Gets the FFI type enum value for this <code>Type</code>
@@ -125,8 +125,8 @@ public abstract class Type {
      *
      * @return  The address of the ffi_type structure
      */
-    final long handle() {
-        return handle != 0 ? handle : resolveHandle();
+    final MemoryAddress handle() {
+        return MemoryAddress.isNull(handle) ? handle : resolveHandle();
     }
 
     /**
@@ -159,7 +159,7 @@ public abstract class Type {
         return alignment = getTypeInfo().alignment;
     }
 
-    private long resolveHandle() {
+    private MemoryAddress resolveHandle() {
         return handle = getTypeInfo().handle;
     }
 
@@ -173,7 +173,7 @@ public abstract class Type {
     @Override
     public int hashCode() {
         int hash = 3;
-        hash = 67 * hash + (int) (this.handle() ^ (this.handle() >>> 32));
+        hash = 67 * hash + (int) (this.handle().getRawAddress() ^ (this.handle().getRawAddress() >>> 32));
         return hash;
     }
 
@@ -188,7 +188,7 @@ public abstract class Type {
 
         long[] nativeTypes = new long[types.length];
         for (int i = 0; i < types.length; ++i) {
-            nativeTypes[i] = types[i].handle();
+            nativeTypes[i] = types[i].handle().getRawAddress();
         }
 
         return nativeTypes;
@@ -205,7 +205,7 @@ public abstract class Type {
 
         long[] nativeTypes = new long[types.size()];
         for (int i = 0; i < nativeTypes.length; ++i) {
-            nativeTypes[i] = types.get(i).handle();
+            nativeTypes[i] = types.get(i).handle().getRawAddress();
         }
 
         return nativeTypes;
@@ -240,8 +240,8 @@ public abstract class Type {
         private TypeInfo lookupTypeInfo() {
             try {
                 Foreign foreign = Foreign.getInstance();
-                long handle = foreign.lookupBuiltinType(nativeType.ffiType);
-                if (handle == 0L) {
+                MemoryAddress handle = foreign.lookupBuiltinType(nativeType.ffiType);
+                if (MemoryAddress.isNull(handle)) {
                     throw new NullPointerException("invalid handle for native type " + nativeType);
                 }
 
@@ -288,9 +288,9 @@ public abstract class Type {
         /** The minimum alignment of this type */
         final int alignment;
         /** The address of this type's ffi_type structure */
-        final long handle;
+        final MemoryAddress handle;
 
-        TypeInfo(long handle, int type, int size, int alignment) {
+        TypeInfo(MemoryAddress handle, int type, int size, int alignment) {
             this.handle = handle;
             this.type = type;
             this.size = size;

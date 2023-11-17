@@ -483,7 +483,7 @@ final class Foreign {
      * @param type The FFI type enum value
      * @return The address of the ffi_type struct for this type, or <code>null</code>
      */
-    final native long lookupBuiltinType(int type);
+    final native MemoryAddress lookupBuiltinType(int type);
 
     /**
      * Gets the native size of the type
@@ -491,7 +491,7 @@ final class Foreign {
      * @param handle Address of the type structure
      * @return The native size of the type
      */
-    final native int getTypeSize(long handle);
+    final native int getTypeSize(MemoryAddress handle);
 
     /**
      * Gets the minimum required alignment of the FFI type
@@ -499,7 +499,7 @@ final class Foreign {
      * @param handle Address of the type structure
      * @return The minimum required alignment
      */
-    final native int getTypeAlign(long handle);
+    final native int getTypeAlign(MemoryAddress handle);
 
     /**
      * Gets the primitive type enum for the FFI type
@@ -507,7 +507,7 @@ final class Foreign {
      * @param handle Address of the type structure
      * @return The builtin primitive type of the type structure
      */
-    final native int getTypeType(long handle);
+    final native int getTypeType(MemoryAddress handle);
 
     /**
      * Allocates a new FFI struct or union layout
@@ -518,7 +518,7 @@ final class Foreign {
      * @return The native address of the ffi_type structure for the new struct layout
      * @see #freeAggregate(long)
      */
-    final native long newStruct(long[] fields, boolean isUnion);
+    final native MemoryAddress newStruct(long[] fields, boolean isUnion);
 
     /**
      * Allocates a new FFI array type.
@@ -528,14 +528,14 @@ final class Foreign {
      * @return The native address of the ffi_type structure for the new array layout.
      * @see #freeAggregate(long)
      */
-    final native long newArray(long elementType, int length);
+    final native MemoryAddress newArray(long elementType, int length);
 
     /**
      * Frees a FFI struct, union or array handle allocated via {@link #newStruct} or {@link #newArray}.
      *
      * @param handle The FFI struct handle
      */
-    final native void freeAggregate(long handle);
+    final native void freeAggregate(MemoryAddress handle);
 
     /**
      * Invokes a function with no arguments, and returns a 32 bit integer.

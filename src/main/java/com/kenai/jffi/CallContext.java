@@ -140,7 +140,7 @@ public final class CallContext {
                 | (faultProtect ? Foreign.F_PROTECT : 0);
 
         final long h = foreign.newCallContext(
-                returnType.handle(),
+                returnType.handle().getRawAddress(),
                 Type.nativeHandles(parameterTypes),
                 flags | (fixedParamCount << 16));
         if (h == 0) {

@@ -58,7 +58,7 @@ public final class Array extends Aggregate {
      * @param length the number of elements.
      */
     public Array(Type elementType, int length) {
-        super(Foreign.getInstance(), Foreign.getInstance().newArray(elementType.handle(), length));
+        super(Foreign.getInstance(), Foreign.getInstance().newArray(elementType.handle().getRawAddress(), length));
         this.elementType = elementType;
         this.length = length;
     }

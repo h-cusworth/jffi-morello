@@ -83,6 +83,24 @@ j2p(jlong j)
     return (void *)(uintptr_t) j;
 }
 
+/**
+ * Convert a capability into a java MemoryAddress
+ */
+static inline jobject
+p2ma(JNIEnv* env, void *p)
+{
+    return (*env)->NewMemoryAddress(env, p);
+}
+
+/**
+ * Convert a java MemoryAddress into a capability
+ */
+static inline void*
+ma2p(JNIEnv* env, jobject j)
+{
+    return (*env)->GetMemoryAddress(env, j);
+}
+
 #ifndef __cplusplus
 static inline
 jboolean loadClass(JNIEnv* env, const char *name, jclass *classp)

@@ -38,7 +38,7 @@ import java.util.logging.Logger;
 
 public abstract class Aggregate extends Type {
     private final TypeInfo typeInfo;
-    private final long handle;
+    private final MemoryAddress handle;
     private volatile int disposed;
 
     private static final AtomicIntegerFieldUpdater<Aggregate> UPDATER = AtomicIntegerFieldUpdater.newUpdater(Aggregate.class, "disposed");
@@ -47,8 +47,8 @@ public abstract class Aggregate extends Type {
     @SuppressWarnings({"FieldCanBeLocal", "UnusedDeclaration"})
     private final Foreign foreign;
 
-    Aggregate(Foreign foreign, long handle) {
-        if (handle == 0L) {
+    Aggregate(Foreign foreign, MemoryAddress handle) {
+        if (MemoryAddress.isNull(handle)) {
             throw new NullPointerException("Invalid ffi_type handle");
         }
         this.foreign = foreign;

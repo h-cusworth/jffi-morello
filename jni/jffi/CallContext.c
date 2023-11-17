@@ -63,7 +63,7 @@ static inline int FFI_ALIGN(int v, int a) {
  */
 JNIEXPORT jlong JNICALL
 Java_com_kenai_jffi_Foreign_newCallContext(JNIEnv* env, jobject self,
-        jlong returnType, jlongArray paramArray, jint flags)
+        jlong returnType, jobjectArray paramArray, jint flags)
 {
     CallContext* ctx = NULL;
     jlong* paramTypes;
